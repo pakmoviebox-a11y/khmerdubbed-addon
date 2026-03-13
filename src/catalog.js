@@ -1,219 +1,143 @@
 const axios = require("axios");
+const cheerio = require("cheerio");
 const NodeCache = require("node-cache");
 
 const BASE_URL = "https://khmerdubbed.com";
-const cache = new NodeCache({ stdTTL: 3600 }); // cache 1 hour
+const cache = new NodeCache({ stdTTL: 3600 });
 
-// WordPress REST API - most WP movie sites use custom post types
-// Common post types: 'movies', 'tvshows', 'series', or just 'post' with categories
-// We try multiple approaches and fall back gracefully
-
-const WP_API = `${BASE_URL}/wp-json/wp/v2`;
-
-// Map our type to likely WP post types (adjust if needed after inspecting your site)
-const POST_TYPE_MAP = {
-  movie: ["movies", "movie", "films", "post"],
-  series: ["tvshows", "tv-shows", "series", "episodes", "post"],
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.5",
+  "Referer": BASE_URL,
 };
 
-async function discoverPostType(type) {
-  const cacheKey = `posttype_${type}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return cached;
-
-  const candidates = POST_TYPE_MAP[type];
-  for (const pt of candidates) {
-    try {
-      const url = `${WP_API}/${pt}?per_page=1`;
-      const res = await axios.get(url, { timeout: 8000 });
-      if (res.status === 200 && Array.isArray(res.data) && res.data.length > 0) {
-        console.log(`[DISCOVER] Found post type: ${pt} for ${type}`);
-        cache.set(cacheKey, pt);
-        return pt;
-      }
-    } catch {
-      // try next
-    }
+async function fetchPage(url) {
+  try {
+    const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
+    return res.data;
+  } catch (err) {
+    console.error("[FETCH]", url, err.message);
+    return null;
   }
-
-  // Fallback: use 'post' with category filtering
-  console.log(`[DISCOVER] Falling back to 'post' for ${type}`);
-  cache.set(cacheKey, "post");
-  return "post";
 }
 
-async function fetchPosts(type, extra = {}) {
-  const postType = await discoverPostType(type);
+async function getCatalog(type, extra = {}) {
   const skip = parseInt(extra.skip || 0);
   const page = Math.floor(skip / 20) + 1;
   const search = extra.search || "";
-
-  let url = `${WP_API}/${postType}?per_page=20&page=${page}&_embed=true`;
-  if (search) url += `&search=${encodeURIComponent(search)}`;
-
-  // If using generic 'post', try to filter by category matching type
-  if (postType === "post" && !search) {
-    const catId = await getCategoryId(type);
-    if (catId) url += `&categories=${catId}`;
-  }
 
   const cacheKey = `catalog_${type}_${page}_${search}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  try {
-    const res = await axios.get(url, { timeout: 10000 });
-    cache.set(cacheKey, res.data);
-    return res.data;
-  } catch (err) {
-    console.error("[FETCH POSTS]", err.message);
-    return [];
+  let url;
+  if (search) {
+    url = `${BASE_URL}/?s=${encodeURIComponent(search)}`;
+  } else if (type === "movie") {
+    url = `${BASE_URL}/movie/page/${page}/`;
+  } else {
+    url = `${BASE_URL}/series/page/${page}/`;
   }
-}
 
-async function getCategoryId(type) {
-  const cacheKey = `catid_${type}`;
-  const cached = cache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  const html = await fetchPage(url);
+  if (!html) return [];
 
-  const keywords = type === "movie"
-    ? ["movie", "movies", "film", "films"]
-    : ["series", "tv", "tvshow", "drama"];
+  const $ = cheerio.load(html);
+  const metas = [];
+  const seen = new Set();
 
-  try {
-    const res = await axios.get(`${WP_API}/categories?per_page=50`, { timeout: 8000 });
-    const categories = res.data;
-    for (const kw of keywords) {
-      const match = categories.find(
-        (c) => c.slug.includes(kw) || c.name.toLowerCase().includes(kw)
-      );
-      if (match) {
-        cache.set(cacheKey, match.id);
-        return match.id;
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href") || "";
+    if (
+      (href.includes("/movie/") || href.includes("/series/") || href.includes("/tv/")) &&
+      !href.includes("/page/") &&
+      !href.includes("/episode/") &&
+      !seen.has(href)
+    ) {
+      seen.add(href);
+      const title =
+        $(el).find("img").attr("alt") ||
+        $(el).attr("title") ||
+        $(el).text().trim();
+      const img =
+        $(el).find("img").attr("src") ||
+        $(el).find("img").attr("data-src") ||
+        $(el).find("img").attr("data-lazy-src") ||
+        null;
+
+      if (title && title.length > 1) {
+        const id = Buffer.from(href).toString("base64url");
+        metas.push({ id: `khmerdubbed:${id}`, type, name: title, poster: img, website: href });
       }
     }
-  } catch {}
+  });
 
-  cache.set(cacheKey, null);
-  return null;
+  cache.set(cacheKey, metas);
+  return metas;
 }
 
-function buildMeta(post, type) {
-  // Extract thumbnail
-  let poster = null;
-  try {
-    poster =
-      post._embedded?.["wp:featuredmedia"]?.[0]?.source_url ||
-      post.jetpack_featured_media_url ||
-      null;
-  } catch {}
-
-  // Clean title
-  const title = post.title?.rendered
-    ? post.title.rendered.replace(/<[^>]+>/g, "")
-    : "Unknown";
-
-  // Description
-  const description = post.excerpt?.rendered
-    ? post.excerpt.rendered.replace(/<[^>]+>/g, "").trim()
-    : "";
-
-  // Build ID: prefix with our namespace + WP post ID + slug
-  const id = `khmerdubbed:${post.id}`;
-
-  const meta = {
-    id,
-    type,
-    name: title,
-    poster,
-    description,
-    background: poster,
-    // Release year from date
-    releaseInfo: post.date ? post.date.substring(0, 4) : undefined,
-    // Link back to site
-    website: post.link,
-  };
-
-  return meta;
-}
-
-async function getCatalog(type, extra = {}) {
-  const posts = await fetchPosts(type, extra);
-  return posts.map((p) => buildMeta(p, type));
-}
-
-async function getMeta(type, id) {
-  // id format: khmerdubbed:12345
-  const wpId = id.split(":")[1];
-  if (!wpId) return null;
+async function getMeta(type, stremioId) {
+  const id = stremioId.split(":")[1];
+  if (!id) return null;
 
   const cacheKey = `meta_${id}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  const postType = await discoverPostType(type);
+  let url;
+  try { url = Buffer.from(id, "base64url").toString("utf8"); } catch { return null; }
 
-  try {
-    const res = await axios.get(`${WP_API}/${postType}/${wpId}?_embed=true`, {
-      timeout: 10000,
-    });
-    const post = res.data;
-    const meta = buildMeta(post, type);
+  const html = await fetchPage(url);
+  if (!html) return null;
 
-    // For series, try to extract episodes (WP REST API or custom endpoint)
-    if (type === "series") {
-      meta.videos = await getEpisodes(post);
-    }
+  const $ = cheerio.load(html);
 
-    cache.set(cacheKey, meta);
-    return meta;
-  } catch (err) {
-    console.error("[GET META]", err.message);
-    return null;
-  }
-}
+  const title =
+    $("meta[property='og:title']").attr("content") ||
+    $("h1").first().text().trim() ||
+    $("title").text().replace(/[-|].*$/, "").trim();
 
-async function getEpisodes(post) {
-  // Episodes may be stored in post content as links, or as child posts
-  // Try child posts first
-  const wpId = post.id;
-  const videos = [];
+  const poster =
+    $("meta[property='og:image']").attr("content") ||
+    $(".poster img, .film-poster img, .movie-poster img, .wp-post-image").first().attr("src") ||
+    null;
 
-  try {
-    const postType = "episodes"; // common custom post type
-    const res = await axios.get(
-      `${WP_API}/${postType}?parent=${wpId}&per_page=100&orderby=date&order=asc`,
-      { timeout: 8000 }
-    );
+  const description =
+    $("meta[property='og:description']").attr("content") ||
+    $(".description, .synopsis, .entry-content p").first().text().trim() ||
+    "";
 
-    if (Array.isArray(res.data) && res.data.length > 0) {
-      res.data.forEach((ep, i) => {
-        const title = ep.title?.rendered?.replace(/<[^>]+>/g, "") || `Episode ${i + 1}`;
-        // Parse season/episode from title if possible
-        const epMatch = title.match(/[Ee]p(?:isode)?\s*(\d+)/);
-        const seasonMatch = title.match(/[Ss](?:eason)?\s*(\d+)/);
-        videos.push({
-          id: `khmerdubbed:${ep.id}`,
-          title,
-          season: seasonMatch ? parseInt(seasonMatch[1]) : 1,
-          episode: epMatch ? parseInt(epMatch[1]) : i + 1,
-          released: ep.date,
-        });
+  const meta = { id: stremioId, type, name: title, poster, background: poster, description, website: url };
+
+  if (type === "series") {
+    const videos = [];
+    const seen = new Set();
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href") || "";
+      if (!href.includes("/episode/") || seen.has(href)) return;
+      seen.add(href);
+      const text = $(el).text().trim();
+      const epMatch = href.match(/episode[\/\-_]?0*(\d+)/i);
+      const epNum = epMatch ? parseInt(epMatch[1]) : videos.length + 1;
+      const epId = Buffer.from(href).toString("base64url");
+      videos.push({
+        id: `khmerdubbed:${epId}`,
+        title: text || `Episode ${epNum}`,
+        season: 1,
+        episode: epNum,
+        released: new Date().toISOString(),
       });
-      return videos;
-    }
-  } catch {}
+    });
+    meta.videos = videos.sort((a, b) => a.episode - b.episode);
+  }
 
-  // Fallback: treat the series post itself as a single video
-  videos.push({
-    id: `khmerdubbed:${wpId}`,
-    title: post.title?.rendered?.replace(/<[^>]+>/g, "") || "Episode 1",
-    season: 1,
-    episode: 1,
-    released: post.date,
-  });
-
-  return videos;
+  cache.set(cacheKey, meta);
+  return meta;
 }
 
-module.exports = { getCatalog, getMeta };
+function idToUrl(id) {
+  try { return Buffer.from(id, "base64url").toString("utf8"); } catch { return null; }
+}
+
+module.exports = { getCatalog, getMeta, idToUrl };

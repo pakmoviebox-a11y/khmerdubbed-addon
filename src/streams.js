@@ -1,67 +1,23 @@
 const axios = require("axios");
 const cheerio = require("cheerio");
 const NodeCache = require("node-cache");
+const { idToUrl } = require("./catalog");
 
 const BASE_URL = "https://khmerdubbed.com";
-const WP_API = `${BASE_URL}/wp-json/wp/v2`;
-const cache = new NodeCache({ stdTTL: 1800 }); // 30 min cache for streams
+const cache = new NodeCache({ stdTTL: 1800 });
 
-// ─── MAIN ENTRY ──────────────────────────────────────────────────────────────
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.5",
+  "Referer": BASE_URL,
+};
 
-async function getStreams(type, id) {
-  const cacheKey = `streams_${id}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return cached;
-
-  const wpId = id.split(":")[1];
-  if (!wpId) return [];
-
-  // 1. Get the post permalink from WP REST API
-  const postUrl = await getPostUrl(wpId);
-  if (!postUrl) return [];
-
-  // 2. Scrape the page HTML
-  const html = await fetchPage(postUrl);
-  if (!html) return [];
-
-  // 3. Extract video URLs from the page
-  const streams = await extractStreams(html, postUrl);
-
-  if (streams.length > 0) {
-    cache.set(cacheKey, streams);
-  }
-
-  return streams;
-}
-
-// ─── FETCH POST URL ───────────────────────────────────────────────────────────
-
-async function getPostUrl(wpId) {
-  // Try multiple post types
-  const postTypes = ["movies", "movie", "tvshows", "series", "episodes", "post"];
-  for (const pt of postTypes) {
-    try {
-      const res = await axios.get(`${WP_API}/${pt}/${wpId}`, { timeout: 8000 });
-      if (res.data?.link) return res.data.link;
-    } catch {}
-  }
-  return null;
-}
-
-// ─── FETCH PAGE ───────────────────────────────────────────────────────────────
-
-async function fetchPage(url) {
+async function fetchPage(url, referer) {
   try {
     const res = await axios.get(url, {
+      headers: { ...HEADERS, Referer: referer || BASE_URL },
       timeout: 15000,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": BASE_URL,
-      },
     });
     return res.data;
   } catch (err) {
@@ -70,206 +26,179 @@ async function fetchPage(url) {
   }
 }
 
-// ─── EXTRACT STREAMS ─────────────────────────────────────────────────────────
+async function getStreams(type, stremioId) {
+  const cacheKey = `streams_${stremioId}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const id = stremioId.split(":")[1];
+  if (!id) return [];
+
+  const pageUrl = idToUrl(id);
+  if (!pageUrl) return [];
+
+  console.log("[STREAM] Fetching page:", pageUrl);
+
+  const html = await fetchPage(pageUrl);
+  if (!html) return [];
+
+  const streams = await extractStreams(html, pageUrl);
+
+  console.log(`[STREAM] Found ${streams.length} stream(s)`);
+  if (streams.length > 0) cache.set(cacheKey, streams);
+
+  return streams;
+}
 
 async function extractStreams(html, pageUrl) {
   const streams = [];
   const $ = cheerio.load(html);
 
-  // ── 1. Direct MP4 / video src ──────────────────────────────────────────────
-  $("video source, video[src]").each((_, el) => {
-    const src = $(el).attr("src") || $(el).attr("data-src");
-    if (src && src.match(/\.mp4(\?|$)/i)) {
-      streams.push({
-        url: src,
-        title: "Direct MP4",
-        behaviorHints: { notWebReady: false },
-      });
-    }
-  });
+  // ── 1. ok.ru links ────────────────────────────────────────────────────────
+  const okruMatches = [
+    ...new Set([
+      ...(html.match(/https?:\/\/(?:www\.)?ok\.ru\/video\/[\w\d]+[^\s"'<>]*/gi) || []),
+      ...(html.match(/https?:\/\/(?:www\.)?ok\.ru\/videoembed\/[\w\d]+[^\s"'<>]*/gi) || []),
+    ]),
+  ];
 
-  // ── 2. Scan page HTML for direct MP4 URLs ─────────────────────────────────
-  const mp4Matches = html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/gi) || [];
-  for (const url of [...new Set(mp4Matches)]) {
-    if (!streams.find((s) => s.url === url)) {
-      streams.push({ url, title: "Video (MP4)" });
+  for (const okUrl of okruMatches) {
+    const stream = await resolveOkRu(okUrl);
+    if (stream) {
+      streams.push(...stream);
     }
   }
 
-  // ── 3. iframes (embedded players) ─────────────────────────────────────────
+  // ── 2. iframes ────────────────────────────────────────────────────────────
   const iframeSrcs = [];
-  $("iframe").each((_, el) => {
-    const src =
-      $(el).attr("src") ||
-      $(el).attr("data-src") ||
-      $(el).attr("data-lazy-src");
+  $("iframe[src], iframe[data-src]").each((_, el) => {
+    const src = $(el).attr("src") || $(el).attr("data-src") || "";
     if (src) iframeSrcs.push(src);
   });
 
-  // Also scan for iframe srcs in JS strings
-  const jsIframes =
-    html.match(/(?:src|iframe)['":\s]+['"](https?:\/\/[^\s'"<>]+)['"]/gi) || [];
-  for (const match of jsIframes) {
-    const urlMatch = match.match(/https?:\/\/[^\s'"<>]+/);
-    if (urlMatch) iframeSrcs.push(urlMatch[0]);
+  // Also find iframes in JS
+  const jsIframes = html.match(/['"](https?:\/\/[^'"]*(?:embed|player|video)[^'"]*)['"]/gi) || [];
+  for (const m of jsIframes) {
+    const u = m.replace(/['"]/g, "");
+    if (u.includes("ok.ru") || u.includes("embed") || u.includes("player")) {
+      iframeSrcs.push(u);
+    }
   }
 
-  // Resolve each iframe
   for (const src of [...new Set(iframeSrcs)]) {
-    const resolved = await resolveEmbed(src, pageUrl);
-    if (resolved.length > 0) streams.push(...resolved);
-  }
-
-  // ── 4. Known JS player variables ──────────────────────────────────────────
-  const jwMatch = html.match(/file\s*:\s*['"]([^'"]+\.(?:mp4|m3u8)[^'"]*)['"]/gi) || [];
-  for (const m of jwMatch) {
-    const urlMatch = m.match(/https?:\/\/[^\s'"]+/);
-    if (urlMatch && !streams.find((s) => s.url === urlMatch[0])) {
-      streams.push({ url: urlMatch[0], title: "JW Player Stream" });
-    }
-  }
-
-  // HLS m3u8
-  const m3u8Matches = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi) || [];
-  for (const url of [...new Set(m3u8Matches)]) {
-    if (!streams.find((s) => s.url === url)) {
-      streams.push({ url, title: "HLS Stream" });
-    }
-  }
-
-  console.log(`[STREAMS] Found ${streams.length} stream(s) on page: ${pageUrl}`);
-  return streams;
-}
-
-// ─── RESOLVE EMBED URLS ───────────────────────────────────────────────────────
-
-async function resolveEmbed(embedUrl, referer) {
-  const streams = [];
-
-  try {
-    // ── Streamtape ────────────────────────────────────────────────────────────
-    if (embedUrl.includes("streamtape.com") || embedUrl.includes("streamtape.to")) {
-      const stream = await resolveStreamtape(embedUrl);
-      if (stream) streams.push({ url: stream, title: "Streamtape" });
-      return streams;
-    }
-
-    // ── Doodstream ────────────────────────────────────────────────────────────
-    if (embedUrl.includes("dood.") || embedUrl.includes("doodstream")) {
-      const stream = await resolveDoodstream(embedUrl);
-      if (stream) streams.push({ url: stream, title: "Doodstream" });
-      return streams;
-    }
-
-    // ── Fembed / Fembad ───────────────────────────────────────────────────────
-    if (embedUrl.includes("fembed.com") || embedUrl.includes("fembad.org")) {
-      const stream = await resolveFembed(embedUrl);
-      if (stream) streams.push({ url: stream, title: "Fembed" });
-      return streams;
-    }
-
-    // ── Filemoon ──────────────────────────────────────────────────────────────
-    if (embedUrl.includes("filemoon")) {
-      const stream = await resolveFilemoon(embedUrl);
-      if (stream) streams.push({ url: stream, title: "Filemoon" });
-      return streams;
-    }
-
-    // ── Generic: fetch the embed page and look for video ──────────────────────
-    const html = await fetchPage(embedUrl);
-    if (html) {
-      const mp4 = html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
-      const m3u8 = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
-      if (mp4) streams.push({ url: mp4[0], title: "Embedded MP4" });
-      else if (m3u8) streams.push({ url: m3u8[0], title: "Embedded HLS" });
-    }
-  } catch (err) {
-    console.error("[RESOLVE EMBED]", embedUrl, err.message);
-  }
-
-  return streams;
-}
-
-// ─── STREAMTAPE RESOLVER ──────────────────────────────────────────────────────
-
-async function resolveStreamtape(url) {
-  try {
-    const html = await fetchPage(url);
-    if (!html) return null;
-    // Streamtape uses a JS obfuscated URL split across two variables
-    const match1 = html.match(/robotlink\)\.\s*innerHTML\s*=\s*['"]([^'"]+)['"]/);
-    const match2 = html.match(/\+\s*\(['"]([^'"]+)['"]\)/);
-    if (match1 && match2) {
-      const part1 = match1[1];
-      const part2 = match2[1];
-      return `https:${part1}${part2}`;
-    }
-    // Alternative pattern
-    const altMatch = html.match(/document\.getElementById\('norobotlink'\).*?innerHTML\s*=\s*(['"])(.*?)\1/s);
-    if (altMatch) return `https:${altMatch[2]}`;
-  } catch {}
-  return null;
-}
-
-// ─── DOODSTREAM RESOLVER ──────────────────────────────────────────────────────
-
-async function resolveDoodstream(url) {
-  try {
-    // Convert /e/ to /d/ for the page
-    const pageUrl = url.replace("/e/", "/d/");
-    const html = await fetchPage(pageUrl);
-    if (!html) return null;
-
-    const passMatch = html.match(/pass_md5\/([^'"]+)/);
-    if (!passMatch) return null;
-
-    const passUrl = `https://dood.to/pass_md5/${passMatch[1]}`;
-    const passRes = await axios.get(passUrl, {
-      headers: { Referer: pageUrl },
-      timeout: 8000,
-    });
-
-    const token = html.match(/token=([^'"&]+)/)?.[1] || "abc123";
-    const ts = Date.now();
-    return `${passRes.data}${token}?token=${token}&expiry=${ts}`;
-  } catch {}
-  return null;
-}
-
-// ─── FEMBED RESOLVER ─────────────────────────────────────────────────────────
-
-async function resolveFembed(url) {
-  try {
-    const id = url.split("/").pop();
-    const apiUrl = `${new URL(url).origin}/api/source/${id}`;
-    const res = await axios.post(
-      apiUrl,
-      {},
-      {
-        headers: { Referer: url },
-        timeout: 8000,
+    if (src.includes("ok.ru")) {
+      const resolved = await resolveOkRu(src);
+      if (resolved) streams.push(...resolved);
+    } else {
+      // Generic iframe - fetch and look for video
+      const iHtml = await fetchPage(src, pageUrl);
+      if (iHtml) {
+        const mp4 = iHtml.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
+        const m3u8 = iHtml.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+        if (mp4) streams.push({ url: mp4[0], title: "Video" });
+        else if (m3u8) streams.push({ url: m3u8[0], title: "HLS Stream" });
       }
-    );
-    const files = res.data?.data;
-    if (Array.isArray(files) && files.length > 0) {
-      // Pick highest quality
-      files.sort((a, b) => parseInt(b.label) - parseInt(a.label));
-      return files[0].file;
     }
-  } catch {}
-  return null;
+  }
+
+  // ── 3. Direct MP4 / m3u8 ─────────────────────────────────────────────────
+  const mp4s = html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/gi) || [];
+  const m3u8s = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi) || [];
+
+  for (const url of [...new Set(mp4s)]) {
+    if (!streams.find((s) => s.url === url))
+      streams.push({ url, title: "Direct MP4" });
+  }
+  for (const url of [...new Set(m3u8s)]) {
+    if (!streams.find((s) => s.url === url))
+      streams.push({ url, title: "HLS Stream" });
+  }
+
+  return streams;
 }
 
-// ─── FILEMOON RESOLVER ────────────────────────────────────────────────────────
-
-async function resolveFilemoon(url) {
+// ── ok.ru resolver ────────────────────────────────────────────────────────────
+// ok.ru provides a metadata API we can use to get direct video URLs
+async function resolveOkRu(url) {
   try {
-    const html = await fetchPage(url);
+    // Normalise: get video ID
+    const idMatch = url.match(/\/video(?:embed)?\/(\d+)/);
+    if (!idMatch) return null;
+    const videoId = idMatch[1];
+
+    console.log("[OK.RU] Resolving video ID:", videoId);
+
+    // Fetch the embed page
+    const embedUrl = `https://ok.ru/videoembed/${videoId}`;
+    const html = await fetchPage(embedUrl, url);
     if (!html) return null;
-    const m3u8 = html.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/);
-    return m3u8 ? m3u8[0] : null;
-  } catch {}
-  return null;
+
+    // ok.ru stores video data in a JSON blob called "flashvars" or "data-options"
+    const dataMatch =
+      html.match(/data-options="([^"]+)"/) ||
+      html.match(/flashvars="([^"]+)"/);
+
+    if (dataMatch) {
+      const raw = dataMatch[1].replace(/&amp;/g, "&").replace(/&quot;/g, '"');
+      let data;
+      try { data = JSON.parse(decodeURIComponent(raw)); } catch {
+        try { data = JSON.parse(raw); } catch { }
+      }
+
+      if (data?.flashvars?.metadata) {
+        const meta = JSON.parse(data.flashvars.metadata);
+        return extractOkRuVideos(meta);
+      }
+      if (data?.metadata) {
+        return extractOkRuVideos(data.metadata);
+      }
+    }
+
+    // Alternative: look for JSON in a script tag
+    const scriptMatch = html.match(/\"videos\"\s*:\s*(\[[\s\S]*?\])/);
+    if (scriptMatch) {
+      const videos = JSON.parse(scriptMatch[1]);
+      return videos
+        .filter((v) => v.url)
+        .map((v) => ({
+          url: v.url,
+          title: `ok.ru (${v.name || v.type || "video"})`,
+        }));
+    }
+
+    // Last resort: return the embed URL as an external link Stremio can open
+    return [{
+      externalUrl: `https://ok.ru/video/${videoId}`,
+      title: "Open on ok.ru",
+    }];
+
+  } catch (err) {
+    console.error("[OK.RU ERROR]", err.message);
+    return null;
+  }
+}
+
+function extractOkRuVideos(meta) {
+  const streams = [];
+  const videos = meta?.videos || [];
+  // Quality order: highest first
+  const qualityOrder = ["full hd", "hd", "sd", "low", "lowest", "mobile"];
+  const sorted = [...videos].sort((a, b) => {
+    const ai = qualityOrder.indexOf((a.name || "").toLowerCase());
+    const bi = qualityOrder.indexOf((b.name || "").toLowerCase());
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  for (const v of sorted) {
+    if (v.url) {
+      streams.push({
+        url: v.url,
+        title: `ok.ru (${v.name || "video"})`,
+        behaviorHints: { notWebReady: false },
+      });
+    }
+  }
+  return streams;
 }
 
 module.exports = { getStreams };
