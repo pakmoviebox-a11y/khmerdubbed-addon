@@ -1,23 +1,27 @@
 const axios = require("axios");
-const cheerio = require("cheerio");
 const NodeCache = require("node-cache");
 
 const BASE_URL = "https://khmerdubbed.com";
+const API_URL = "https://api.khmerdubbed.com";
 const cache = new NodeCache({ stdTTL: 3600 });
 
+// Must send Origin + Referer to avoid 403
 const HEADERS = {
+  "Origin": BASE_URL,
+  "Referer": BASE_URL + "/",
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.5",
-  "Referer": BASE_URL,
+  "Accept": "application/json, text/plain, */*",
 };
 
-async function fetchPage(url) {
+async function apiGet(path) {
   try {
-    const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
+    const res = await axios.get(`${API_URL}${path}`, {
+      headers: HEADERS,
+      timeout: 15000,
+    });
     return res.data;
   } catch (err) {
-    console.error("[FETCH]", url, err.message);
+    console.error("[API]", path, err.response?.status, err.message);
     return null;
   }
 }
@@ -31,113 +35,90 @@ async function getCatalog(type, extra = {}) {
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  let url;
+  // Try common API patterns
+  let data = null;
+
   if (search) {
-    url = `${BASE_URL}/?s=${encodeURIComponent(search)}`;
-  } else if (type === "movie") {
-    url = `${BASE_URL}/movie/page/${page}/`;
+    data = await apiGet(`/search?q=${encodeURIComponent(search)}&type=${type}`);
+    if (!data) data = await apiGet(`/videos?search=${encodeURIComponent(search)}&type=${type}`);
   } else {
-    url = `${BASE_URL}/series/page/${page}/`;
+    data = await apiGet(`/videos?type=${type}&page=${page}&limit=20`);
+    if (!data) data = await apiGet(`/${type}s?page=${page}&limit=20`);
+    if (!data) data = await apiGet(`/videos?category=${type}&page=${page}`);
   }
 
-  const html = await fetchPage(url);
-  if (!html) return [];
+  if (!data) {
+    console.error("[CATALOG] All API attempts failed for", type);
+    return [];
+  }
 
-  const $ = cheerio.load(html);
-  const metas = [];
-  const seen = new Set();
+  // Handle various response shapes
+  const items = Array.isArray(data)
+    ? data
+    : data.results || data.data || data.videos || data.items || [];
 
-  $("a[href]").each((_, el) => {
-    const href = $(el).attr("href") || "";
-    if (
-      (href.includes("/movie/") || href.includes("/series/") || href.includes("/tv/")) &&
-      !href.includes("/page/") &&
-      !href.includes("/episode/") &&
-      !seen.has(href)
-    ) {
-      seen.add(href);
-      const title =
-        $(el).find("img").attr("alt") ||
-        $(el).attr("title") ||
-        $(el).text().trim();
-      const img =
-        $(el).find("img").attr("src") ||
-        $(el).find("img").attr("data-src") ||
-        $(el).find("img").attr("data-lazy-src") ||
-        null;
-
-      if (title && title.length > 1) {
-        const id = Buffer.from(href).toString("base64url");
-        metas.push({ id: `khmerdubbed:${id}`, type, name: title, poster: img, website: href });
-      }
-    }
-  });
-
+  const metas = items.map((item) => buildMeta(item, type));
   cache.set(cacheKey, metas);
   return metas;
 }
 
-async function getMeta(type, stremioId) {
-  const id = stremioId.split(":")[1];
-  if (!id) return null;
+function buildMeta(item, type) {
+  const slug = item.slug || item.id || item._id || "";
+  const id = `khmerdubbed:${slug}`;
 
-  const cacheKey = `meta_${id}`;
+  const poster =
+    item.thumbnail ||
+    item.poster ||
+    item.image ||
+    item.cover ||
+    (slug ? `${API_URL}/static/thumbnail/${slug}.jpg` : null);
+
+  return {
+    id,
+    type,
+    name: item.title || item.name || slug,
+    poster,
+    background: poster,
+    description: item.description || item.synopsis || "",
+    releaseInfo: item.year ? String(item.year) : undefined,
+    website: `${BASE_URL}/${type}/${slug}`,
+  };
+}
+
+async function getMeta(type, stremioId) {
+  const slug = stremioId.split(":")[1];
+  if (!slug) return null;
+
+  const cacheKey = `meta_${slug}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  let url;
-  try { url = Buffer.from(id, "base64url").toString("utf8"); } catch { return null; }
+  const data = await apiGet(`/videos/${slug}`);
+  if (!data) return null;
 
-  const html = await fetchPage(url);
-  if (!html) return null;
+  const meta = buildMeta(data, type);
 
-  const $ = cheerio.load(html);
-
-  const title =
-    $("meta[property='og:title']").attr("content") ||
-    $("h1").first().text().trim() ||
-    $("title").text().replace(/[-|].*$/, "").trim();
-
-  const poster =
-    $("meta[property='og:image']").attr("content") ||
-    $(".poster img, .film-poster img, .movie-poster img, .wp-post-image").first().attr("src") ||
-    null;
-
-  const description =
-    $("meta[property='og:description']").attr("content") ||
-    $(".description, .synopsis, .entry-content p").first().text().trim() ||
-    "";
-
-  const meta = { id: stremioId, type, name: title, poster, background: poster, description, website: url };
-
+  // For series get episodes
   if (type === "series") {
-    const videos = [];
-    const seen = new Set();
-    $("a[href]").each((_, el) => {
-      const href = $(el).attr("href") || "";
-      if (!href.includes("/episode/") || seen.has(href)) return;
-      seen.add(href);
-      const text = $(el).text().trim();
-      const epMatch = href.match(/episode[\/\-_]?0*(\d+)/i);
-      const epNum = epMatch ? parseInt(epMatch[1]) : videos.length + 1;
-      const epId = Buffer.from(href).toString("base64url");
-      videos.push({
-        id: `khmerdubbed:${epId}`,
-        title: text || `Episode ${epNum}`,
-        season: 1,
-        episode: epNum,
-        released: new Date().toISOString(),
-      });
-    });
-    meta.videos = videos.sort((a, b) => a.episode - b.episode);
+    const epData = await apiGet(`/videos/${slug}/episodes`);
+    if (epData) {
+      const episodes = Array.isArray(epData)
+        ? epData
+        : epData.episodes || epData.data || epData.results || [];
+
+      meta.videos = episodes.map((ep, i) => ({
+        id: `khmerdubbed:${slug}:ep:${ep.episode_number || ep.number || ep.ep || i + 1}`,
+        title: ep.title || `Episode ${ep.episode_number || ep.number || i + 1}`,
+        season: ep.season || ep.season_number || 1,
+        episode: ep.episode_number || ep.number || ep.ep || i + 1,
+        released: ep.created_at || ep.date || new Date().toISOString(),
+        thumbnail: ep.thumbnail || null,
+      }));
+    }
   }
 
   cache.set(cacheKey, meta);
   return meta;
 }
 
-function idToUrl(id) {
-  try { return Buffer.from(id, "base64url").toString("utf8"); } catch { return null; }
-}
-
-module.exports = { getCatalog, getMeta, idToUrl };
+module.exports = { getCatalog, getMeta };
